@@ -2539,18 +2539,22 @@ impl<'a> Socket<'a> {
         let mut n = 0;
 
         let find_block = |seq: TcpSeqNumber| {
+            if seq < ack {
+                // There can't be anything in the assembler earlier than the
+                // current packet ACK.
+                return None;
+            }
+            let offset = seq - ack;
             self.assembler
                 .iter_data()
+                .find(|&(l, r)| l <= offset && offset < r)
                 .map(|(l, r)| (ack + l, ack + r))
-                .find(|&(l, r)| l <= seq && seq < r)
         };
 
         // RFC 2018: the first SACK block MUST specify the contiguous block of
         // data containing the segment which triggered this ACK, unless that
         // segment advanced the Acknowledgment Number field in the header.
-        if let Some(seq) = self.local_rx_last_seq
-            && let Some(block) = find_block(seq)
-        {
+        if let Some(block) = self.local_rx_last_seq.and_then(find_block) {
             blocks[0] = Some(block);
             n = 1;
         }
@@ -2561,29 +2565,32 @@ impl<'a> Socket<'a> {
         //
         // We map blocks into their current islands before reporting them.
         for block in self.local_sack_history.iter().flatten() {
-            if n == blocks.len() {
-                break;
-            }
-
-            // TODO: Could be more efficient
-            if let Some(island) = find_block(block.0)
+            if block.1 > ack
+                && let Some(island) = find_block(ack.max(block.0))
                 && !blocks[..n].contains(&Some(island))
             {
                 blocks[n] = Some(island);
                 n += 1;
+
+                if n == blocks.len() {
+                    return blocks;
+                }
             }
         }
 
         // Remaining slots are filled using islands within the assembler.
-        for island in self.assembler.iter_data().map(|(l, r)| (ack + l, ack + r)) {
-            if n == blocks.len() {
-                break;
-            }
-
-            // TODO: Could be more efficient
-            if !blocks[..n].contains(&Some(island)) {
-                blocks[n] = Some(island);
+        for island in self
+            .assembler
+            .iter_data()
+            .map(|(l, r)| Some((ack + l, ack + r)))
+        {
+            if !blocks[..n].contains(&island) {
+                blocks[n] = island;
                 n += 1;
+
+                if n == blocks.len() {
+                    return blocks;
+                }
             }
         }
 
@@ -11474,6 +11481,141 @@ mod test {
             }]
         );
         assert_eq!(s.local_rx_last_seq, None);
+    }
+
+    /// Case:
+    /// Three out-of-order segments fill the three SACK blocks. Then an in-order
+    /// segment advances the cumulative ACK past the first out-of-order block.
+    /// A further out-of-order block then populates the third slot again.
+    ///
+    /// Outcome:
+    /// When cumulative ACK advances to 6500, block [6000, 6500) is acknowledged
+    /// and removed from SACK reporting. The remaining unacknowledged blocks
+    /// [7000, 7500) and [8000, 8500) are repeated. The next out-of-order block
+    /// then takes the third history slot and is emitted with the transmit.
+    ///
+    ///                         +-----------------+-----------------+-----------------+
+    ///                         |   First Block   |  Second Block   |   Third Block   |
+    /// +------------+----------+--------+--------+--------+--------+--------+--------+
+    /// |   Segment  |    ACK   |  Left  |  Right |  Left  |  Right |  Left  |  Right |
+    /// +------------+----------+--------+--------+--------+--------+--------+--------+
+    /// |    8000    |   5000   |  8000  |  8500  |        |        |        |        |
+    /// |    7000    |   5000   |  7000  |  7500  |  8000  |  8500  |        |        |
+    /// |    6000    |   5000   |  6000  |  6500  |  7000  |  7500  |  8000  |  8500  |
+    /// | 5000..6000 |   6500   |  7000  |  7500  |  8000  |  8500  |        |        |
+    /// |    9000    |   6500   |  9000  |  9500  |  7000  |  7500  |  8000  |  8500  |
+    /// |  transmit  |   6500   |  9000  |  9500  |  7000  |  7500  |  8000  |  8500  |
+    /// +------------+----------+--------+--------+--------+--------+--------+--------+
+    #[test]
+    fn test_sack_purges_acknowledged_blocks() {
+        let (mut s, segment) = setup_rfc2018_cases_with_rx_buffer(7000);
+
+        // Receive out-of-order segment 8000..8500.
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + 8000,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &segment,
+                ..SEND_TEMPL
+            },
+            Some(TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 5000),
+                window_len: 7000,
+                sack_ranges: [block(8000, 8500), None, None],
+                ..RECV_TEMPL
+            })
+        );
+
+        // Receive out-of-order segment 7000..7500.
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + 7000,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &segment,
+                ..SEND_TEMPL
+            },
+            Some(TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 5000),
+                window_len: 7000,
+                sack_ranges: [block(7000, 7500), block(8000, 8500), None],
+                ..RECV_TEMPL
+            })
+        );
+
+        // Receive out-of-order segment 6000..6500.
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + 6000,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &segment,
+                ..SEND_TEMPL
+            },
+            Some(TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 5000),
+                window_len: 7000,
+                sack_ranges: [block(6000, 6500), block(7000, 7500), block(8000, 8500)],
+                ..RECV_TEMPL
+            })
+        );
+
+        // Receive in-order segment 5000..6000 which advances then cumulative
+        // ACK to 6500 and removes the block 6000..6500.
+        let mut double_segment = segment.clone();
+        double_segment.extend_from_slice(&segment);
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + 5000,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &double_segment,
+                ..SEND_TEMPL
+            },
+            Some(TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 6500),
+                window_len: 5500,
+                sack_ranges: [block(7000, 7500), block(8000, 8500), None],
+                ..RECV_TEMPL
+            })
+        );
+
+        // Receive out-of-order segment 9000..9500, adding to the SACK blocks.
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + 9000,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &segment,
+                ..SEND_TEMPL
+            },
+            Some(TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 6500),
+                window_len: 5500,
+                sack_ranges: [block(9000, 9500), block(7000, 7500), block(8000, 8500)],
+                ..RECV_TEMPL
+            })
+        );
+
+        // Transmit maintains the exact SACK history.
+        s.send_slice(b"a").unwrap();
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 6500),
+                window_len: 5500,
+                payload: b"a",
+                sack_ranges: [block(9000, 9500), block(7000, 7500), block(8000, 8500)],
+                ..RECV_TEMPL
+            }]
+        );
     }
 
     // =========================================================================================//
