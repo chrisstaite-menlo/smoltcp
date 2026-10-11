@@ -1005,17 +1005,18 @@ impl<'a> Repr<'a> {
         }
         if self.sack_permitted {
             length += 2;
+        } else if self.ack_number.is_some() {
+            let sack_range_len: usize = self
+                .sack_ranges
+                .iter()
+                .map(|o| o.map_or(0, |_| 8))
+                .sum();
+            if sack_range_len > 0 {
+                length += sack_range_len + 2;
+            }
         }
         if self.timestamp.is_some() {
             length += 10;
-        }
-        let sack_range_len: usize = self
-            .sack_ranges
-            .iter()
-            .map(|o| o.map(|_| 8).unwrap_or(0))
-            .sum();
-        if sack_range_len > 0 {
-            length += sack_range_len + 2;
         }
         if !length.is_multiple_of(4) {
             length += 4 - length % 4;
@@ -1376,6 +1377,25 @@ mod test {
         let mut repr = packet_repr();
         repr.window_scale = Some(0); // This TCP Option needs 3 bytes.
         assert_eq!(repr.header_len() % 4, 0); // Should e.g. be 28 instead of 27.
+    }
+
+    #[test]
+    #[cfg(feature = "proto-ipv4")]
+    fn test_header_len_sack_ranges() {
+        let mut repr = packet_repr();
+        repr.sack_ranges = [Some((100, 200)), None, None];
+        // When ack_number is None and sack_permitted is false, SACK ranges are
+        // not emitted.
+        assert_eq!(repr.header_len(), 20);
+        // When sack_permitted is true, only SackPermitted
+        // (2 bytes + 2 pad = 24) is emitted.
+        repr.sack_permitted = true;
+        assert_eq!(repr.header_len(), 24);
+        // When ack_number is Some and sack_permitted is false, SACK ranges are
+        // emitted (10 bytes + 2 pad = 32).
+        repr.sack_permitted = false;
+        repr.ack_number = Some(SeqNumber(100));
+        assert_eq!(repr.header_len(), 32);
     }
 
     macro_rules! assert_option_parses {
